@@ -28,7 +28,6 @@ class UrlCrunch
     @ds = ds
     @opts = opts
     @finalurl = host
-    @outputdir = opts.outputdir
     @redirection = nil
     @finalresponse = nil
     @cached_isavailable = nil
@@ -198,7 +197,7 @@ class UrlCrunch
     htmldoc_findmetarefresh()
   end
 
-  def main(&stepfunc)
+  def main()
     check_isavail(@finalurl)
     res = @finalresponse
     msgpiece("available", @cached_isavailable)
@@ -248,9 +247,8 @@ class Uncurl
   end
 
   def do_url(url)
-    stepfunc = lambda{|*a|} 
     hs = UrlCrunch.new(self, @opts, url)
-    if not hs.main(&stepfunc) then
+    if not hs.main() then
     end
   end
 
@@ -270,7 +268,6 @@ end
 
 begin
   opts = OpenStruct.new({
-    outputdir: nil,
     timeout: 10,
   })
   OptionParser.new{|prs|
