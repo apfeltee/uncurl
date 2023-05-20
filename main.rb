@@ -22,31 +22,59 @@ require "http"
 require "nokogiri"
 require "openssl"
 
+DEFAULT_USERAGENT = "Mozilla/5.0 (Windows NT 00.0; Win00; x00) AppleWebKit/000.00 (KHTML, like Gecko) Chrome/000.0.0.0 Safari/000.0" 
+DEFUA_GOOGLE = "Googlebot/2.1 (+http://www.google.com/bot.html)"
+
 # the class that does the actual work.
 class UrlCrunch
-  def initialize(ds, opts, host)
+  def initialize(ds, opts, host, url)
+    # the parent initiator class instance. whatever that might be.
     @ds = ds
+
+    # the options as parsed by OptionParser, et al.
     @opts = opts
-    @finalurl = host
+
+    @finalhost = host
+
+    # the final url, after following redirects.
+    @finalurl = url
+
+    # if, and when, there is a redirect, this will contain the URL.
     @redirection = nil
+
+    # the final response (after following redirects), if any.
+    # if a network error (**not** HTTP error) occurs, this will be nil.
     @finalresponse = nil
-    @cached_isavailable = nil
-    # the raw, unparsed document body
-    # will be nil if failed to fetch document
-    @pagebody = nil
-    # set by find_html_shit
-    # if document is not text/html then @document WILL BE NIL!
-    @document = nil
+
+    # whether the remote URL was retrieved at all - regardless of HTTP status.
+    # if a timeout occurs, or the host cannot be resolved, this will be false.
+    @remoteisavail = false
+    
+    # whether the document content type matches something that can be
+    # parsed via nokogiri. evidently, this will only be true for text/html
+    @pageishtml = false
+
+    # the raw, unparsed document body.
+    # will be nil if failed to fetch document.
+    @rawpagebody = nil
+
+    # the Nokogiri parser instance.
+    # if retrieving the page failed, or @pageishtml == false, then this will be nil.
+    @htmldocument = nil
+
     # quite a few sites have shitty ssl.
+    # NB.: don't do this for data transfers, as it skips verification of certificates.
     @sslctx = OpenSSL::SSL::SSLContext.new
     @sslctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
+
+    @netinfoseen = []
   end
 
   def isavailable
-    if @cached_isavailable != nil then
-      return @cached_isavailable
+    if @remoteisavail != false then
+      return @remoteisavail
     end
-    return check_isavail(@finalurl)
+    return check_isavail(@finalurl, @finalhost)
   end
 
   # write to output, or (WIP) a file, etc.
@@ -73,45 +101,73 @@ class UrlCrunch
     $stdout.write("\n")
   end
 
-  def check_isavail(newurl=nil, level=0)
+  def do_iplookup(host)
+    system("ipinfo", host)
+  end
+
+  def do_whois(host)
+    system("whois", host)
+  end
+
+
+  def print_hostinfo(host)
+    hdown = host.downcase
+    if !@netinfoseen.include?(hdown) then
+      @netinfoseen.push(hdown)
+      if @opts.also_iplookup then
+        do_iplookup(host)
+      end
+      if @opts.also_whois then
+        do_whois(host)
+      end
+    end
+  end
+
+  def check_isavail(newurl, host, level=0)
     tryagain = false
+    parsedurl = Addressable::URI.parse(newurl)
     $stderr.printf("[%s] get(%p) ... ", Time.now.strftime("%T"), newurl)
     begin
-      if (level == 5) then
+      if (@opts.maxredirects > 0) && (level == @opts.maxredirects) then
         raise HTTP::RequestError, "too many redirects"
       end
+      print_hostinfo(parsedurl.host)
       # first, retrieve the URL as-is
-      @finalresponse = HTTP.timeout(@opts.timeout).get(newurl, ssl_context: @sslctx)
+      @finalresponse = HTTP.headers("User-Agent" => @opts.useragent).timeout(@opts.timeout).get(newurl, ssl_context: @sslctx)
       $stderr.printf("received HTTP status %d %p", @finalresponse.code, @finalresponse.reason)
       if @finalresponse.code == 200 then
-        @cached_isavailable = true
+        @remoteisavail = true
       else
         #if there is a HTTP redirect, keep a note, and continue with new url
         if (loc = @finalresponse["location"]) != nil then
           tryagain = true
-          if loc.match?(/^https?:\/\//) then
+          # build url - since @finalresponse may only contain
+          # partial bits, i.e., "/foo/bar"
+          if loc.scrub.match?(/^\w+:\/\//) then
             newurl = loc
           else
             newurl = URI.join(@finalurl, loc)
           end
           @redirection = newurl
         else
-          @cached_isavailable = false
+          @remoteisavail = false
         end
       end
     rescue URI::InvalidURIError => ex
+      # not a lot we can do about that here.
       $stderr.printf("could not parse %p: %s\n", newurl, ex.message)
     rescue Errno::ECONNABORTED => ex
+       # same. it's fucked.
       $stderr.printf("remote caused a Errno::ECONNABORTED ...\n")
-      
     rescue => ex
+      # everything else: maybe check if more clauses could (should?) be added
       $stderr.printf("failed: (%s) %s", ex.class.name, ex.message)
-      @cached_isavailable = false
+      @remoteisavail = false
     ensure
       $stderr.print("\n")
     end
     if tryagain then
-      check_isavail(newurl, level+1)
+      check_isavail(newurl, parsedurl.host, level+1)
     end
   end
 
@@ -168,7 +224,7 @@ class UrlCrunch
   end
 
   def htmldoc_findmetarefresh()
-    metanodes = @document.css("meta")
+    metanodes = @htmldocument.css("meta")
     if (url = find_metarefresh(metanodes)) != nil then
       msgpiece("document.meta_redirect", url)
       msgpiece("document.meta_redirtype", "meta-refresh")
@@ -179,7 +235,7 @@ class UrlCrunch
   # why? who knows! but it is interesting.
   def htmldoc_findtitle()
     tc = 0
-    tnodes = @document.css("title")
+    tnodes = @htmldocument.css("title")
     if have_nodes(tnodes) then
       tall = tnodes.length
       tnodes.each do |tn|
@@ -192,15 +248,35 @@ class UrlCrunch
 
   # what other bits of HTML stuff is interesting at-a-glance?
   def find_html_shit()
-    @document = Nokogiri::HTML(@pagebody)
+    rawbodylen = @rawpagebody.bytesize
+    strippedbody = @rawpagebody.strip
+    strippedlen = strippedbody.bytesize
+    isempty = ((rawbodylen == 0) || (strippedlen == 0))
+    isestr = (isempty ? "is empty" : "")
+    msgpiece("response body", "%s%d bytes (%d bytes when stripped)", isestr, rawbodylen, strippedlen)
+    @htmldocument = Nokogiri::HTML(@rawpagebody)
     htmldoc_findtitle()
     htmldoc_findmetarefresh()
   end
 
+  def printbody
+    idx = 1
+    rawlines = []
+    @rawpagebody.each_line do |ln|
+      rawlines.push(ln)
+    end
+    $stdout.printf("document body (%d lines):\n", rawlines.length)
+    rawlines.each do |ln|
+      printable = ln.dump[1 .. -2]
+      $stdout.printf("  %03d: %s\n", idx, printable)
+      idx += 1
+    end
+  end
+
   def main()
-    check_isavail(@finalurl)
+    check_isavail(@finalurl, @finalhost)
     res = @finalresponse
-    msgpiece("available", @cached_isavailable)
+    msgpiece("available", @remoteisavail)
     if res != nil then
       ctype = res["content-type"]
       # apparently this is valid for http/2 and up? weird. let's pick the last item.
@@ -208,7 +284,7 @@ class UrlCrunch
         msgpiece("content-type-http2", "server responded with several content-type fields. picking last")
         ctype = ctype.last
       end
-      ishtml = ((ctype != nil) && ctype.match?(/text\/html/))
+      @pageishtml = ((ctype != nil) && ctype.match?(/text\/html/))
       if @redirection != nil then
         msgpiece("redirect", "to %p", @redirection.to_s)
         msgpiece("redirtype", "http-location")
@@ -218,20 +294,25 @@ class UrlCrunch
         dumped = v.dump[1 .. -2]
         msgpiece("header", "%p = %p", k, dumped)
       end
-      @pagebody = nil
+      @rawpagebody = nil
       begin
-        @pagebody = res.body.to_s.scrub
+        @rawpagebody = res.body.to_s.scrub
       rescue HTTP::TimeoutError => ex
         $stderr.printf("http timeout encountered (%s: %s)\n", ex.class.name, ex.message)
-        @pagebody = ""
+        @rawpagebody = nil
       rescue HTTP::ConnectionError => ex
         $stderr.printf("connection error encountered (%s: %s)\n", ex.class.name, ex.message)
-        @pagebody = ""
+        @rawpagebody = nil
+      end
+      if @opts.printbody then
+        if @rawpagebody != nil then
+          printbody()
+        end
       end
       if ctype != nil then
         # this is a deliberately placed duplicate field!
         msgpiece("content-type", ctype)
-        if ishtml then
+        if @pageishtml then
           find_html_shit()
         end
       end
@@ -246,8 +327,11 @@ class Uncurl
     @opts = opts
   end
 
-  def do_url(url)
-    hs = UrlCrunch.new(self, @opts, url)
+  def do_url(urlstr)
+    uri = Addressable::URI.parse(urlstr)
+    host = uri.host
+  
+    hs = UrlCrunch.new(self, @opts, host, urlstr)
     if not hs.main() then
     end
   end
@@ -267,12 +351,41 @@ class Uncurl
 end
 
 begin
+  default_timeout = 10
+  default_maxredirs = 5
   opts = OpenStruct.new({
-    timeout: 10,
+    useragent: DEFAULT_USERAGENT,
+    timeout: default_timeout,
+    maxredirects: default_maxredirs,
+    also_iplookup: true,
+    also_whois: false,
+    writecache: true,
+    printbody: false,
   })
   OptionParser.new{|prs|
-    prs.on("-t<n>", "--timeout=<n>"){|v|
+    prs.on("-t<n>", "--timeout=<n>", "set maximum timeout in seconds. defaults to #{default_timeout}"){|v|
       opts.timeout = v.to_i
+    }
+    prs.on("-r<n>", "--redirects=<n>", "set maximum redirects. 0 enables inf redirects (NOT RECOMMENDED). defaults to #{default_maxredirs}"){|v|
+      opts.maxredirects = v.to_i
+    }
+    prs.on("-w", "--[no-]whois", "also do a whois lookup. be warned: this could be quite slow."){|v|
+      opts.also_whois = v
+    }
+    prs.on("-i", "--[no-]iplookup", "also do a IP/Host lookup via 'ipinfo'. obviously needs to be in your PATH."){|v|
+      opts.also_iplookup = v
+    }
+    prs.on("-b", "--[no-]printbody", "print document body as-is"){|v|
+      opts.printbody = v
+    }
+    prs.on("-u<useragent>", "--useragent=<useragent>"){|v|
+      if %w(g gg goog google).include?(v.downcase) then
+        opts.useragent = DEFUA_GOOGLE
+      else
+        opts.useragent = v
+      end
+    }
+    prs.on("-v", "dummy option. does nothing"){
     }
   }.parse!
   if ARGV.empty? then
